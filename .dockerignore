@@ -1,0 +1,7 @@
+.git
+.gitignore
+.dockerignore
+infrastructure
+temp
+**/*_test.go
+**/.DS_Store
