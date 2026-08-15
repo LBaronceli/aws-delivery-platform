@@ -56,11 +56,18 @@ resource "aws_ecs_task_definition" "api" {
 }
 
 resource "aws_ecs_service" "api" {
-  name            = "${local.name_prefix}-api"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.api.arn
-  desired_count   = var.ecs_desired_count
-  launch_type     = "FARGATE"
+  name                              = "${local.name_prefix}-api"
+  cluster                           = aws_ecs_cluster.main.id
+  task_definition                   = aws_ecs_task_definition.api.arn
+  desired_count                     = var.ecs_desired_count
+  launch_type                       = "FARGATE"
+  health_check_grace_period_seconds = 30
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8080
+  }
 
   network_configuration {
     subnets          = data.aws_subnets.default.ids
@@ -74,6 +81,7 @@ resource "aws_ecs_service" "api" {
   }
 
   depends_on = [
-    aws_iam_role_policy_attachment.ecs_task_execution
+    aws_iam_role_policy_attachment.ecs_task_execution,
+    aws_lb_listener.http
   ]
 }
