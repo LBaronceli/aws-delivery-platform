@@ -1,11 +1,11 @@
 FROM golang:1.26-alpine AS build
 
-WORKDIR /src/app
+WORKDIR .
 
-COPY app/go.mod ./
+COPY go.mod ./
 RUN go mod download
 
-COPY app/ ./
+COPY . ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/delivery-api ./cmd/api
 
 FROM alpine:3.23

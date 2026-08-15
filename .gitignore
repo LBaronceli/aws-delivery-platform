@@ -1,1 +1,49 @@
-temp/*
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Go build and test output
+bin/
+coverage.out
+*.test
+
+# Logs and temporary files
+*.log
+temp/
+
+# Terraform working directories
+**/.terraform/*
+
+# Terraform state and plans
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Local Terraform inputs may contain account-specific or sensitive values
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
+
+# Terraform crash and local override files
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Commit .terraform.lock.hcl so provider versions remain reproducible.
