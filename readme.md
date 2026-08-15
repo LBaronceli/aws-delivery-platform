@@ -131,9 +131,17 @@ Set `allowed_cidr` to your current public IP with a `/32` suffix:
 curl https://checkip.amazonaws.com
 ```
 
-Also set `image_uri` to the complete immutable ECR image URI, including its
-tag. The real `terraform.tfvars` is ignored by Git; keep
-`terraform.tfvars.example` updated with safe example values.
+Also set:
+
+- `image_uri` to the complete immutable ECR image URI, including its tag
+- `billing_alert_email` to the address that should receive cost alerts
+- `ecs_desired_count` to `1` while using the API, or `0` to stop its Fargate
+  compute charges
+- `monthly_budget_amount` to the account-wide monthly target, which defaults
+  to USD 10
+
+The real `terraform.tfvars` is ignored by Git; keep `terraform.tfvars.example`
+updated with safe example values.
 
 ## First deployment
 
@@ -192,10 +200,37 @@ terraform -chdir=infrastructure/terraform apply deployment.tfplan
 The configuration creates:
 
 - An encrypted ECR repository with immutable tags and scan-on-push
-- An ECS cluster, task definition, and one-task Fargate service
+- An ECS cluster, task definition, and configurable Fargate service
 - An ECS task execution role for ECR pulls and CloudWatch logging
 - A CloudWatch log group with seven-day retention
 - A security group allowing port `8080` only from `allowed_cidr`
+- An account-wide USD 10 monthly budget with actual-spend alerts at 30%, 50%,
+  80%, and 100%, plus a forecast alert at 80%
+
+The budget deliberately excludes credits and refunds from its calculation so
+they do not hide underlying usage. AWS Budgets receives delayed billing data,
+so it is an alerting guardrail rather than a guaranteed spending cap. The
+budget resource has Terraform deletion protection to prevent it from being
+removed accidentally.
+
+## Start and stop the development service
+
+The local configuration defaults to zero running ECS tasks. To start the API,
+set this in `terraform.tfvars` and apply a complete plan:
+
+```hcl
+ecs_desired_count = 1
+```
+
+When finished testing, change it back and apply again:
+
+```hcl
+ecs_desired_count = 0
+```
+
+Setting the count to zero stops Fargate compute charges without deleting the
+ECS service or its surrounding infrastructure. ECR image storage, S3 state,
+and CloudWatch log storage may still incur small charges.
 
 ## Reach the deployed API
 
