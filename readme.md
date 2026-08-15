@@ -1,193 +1,331 @@
 # AWS Delivery Platform
 
-A small delivery-tracking platform for learning AWS networking, ECS/Fargate,
-queues, events, authentication, and deployment.
+A small delivery-tracking API built with Go and deployed to AWS ECS Fargate
+with Terraform. The project is a practical environment for developing an
+AWS-native service architecture incrementally, without letting the sample
+application dominate the infrastructure work.
 
-The current development deployment is:
+## Current status
+
+Phase 4 is complete. The project currently provides:
+
+- A Go HTTP API for creating, listing, retrieving, and updating deliveries
+- A concurrent-safe in-memory delivery store
+- A multi-stage, non-root Docker image
+- A private ECS Fargate service behind a public Application Load Balancer
+- A custom two-AZ VPC with public and private subnets
+- A persistent ECR repository for application images
+- An account-level USD 10 budget with email alerts
+- Three isolated Terraform states for foundation, platform, and app resources
+
+Delivery data is intentionally in memory for now. It is lost when the API task
+restarts and is not shared between multiple tasks. Aurora PostgreSQL is the
+next planned phase.
+
+## Architecture
 
 ```text
-Developer IP (/32)
+Allowed developer IP
         |
-        | TCP 8080
+        | HTTP :80
         v
-Security group
+Public Application Load Balancer
         |
+        | HTTP :8080
         v
-ECS service -> Fargate task -> ECR image
-                       |
-                       v
-                 CloudWatch Logs
+ECS Fargate task in private subnets
+        |
+        | outbound through NAT
+        v
+ECR and CloudWatch Logs
 ```
 
-The Fargate task currently runs in the default VPC with a public IP. Direct
-access is restricted to the CIDR configured in `terraform.tfvars`. This is a
-temporary development setup; the task will move behind an Application Load
-Balancer and API Gateway later.
+The ALB spans two public subnets and is reachable only from the `/32` CIDR in
+the app variables. The ECS task spans two private subnets, has no public IP,
+and accepts traffic only from the ALB security group. This is a development
+environment: the endpoint currently uses HTTP and does not have authentication.
+
+Terraform is split by lifecycle:
+
+| Root | Purpose | Normal lifecycle |
+| --- | --- | --- |
+| `foundation` | Account budget and billing notifications | Persistent |
+| `platform` | ECR repository and container images | Persistent |
+| `app` | VPC, NAT, ALB, ECS, IAM, and logs | Disposable |
 
 ## Repository layout
 
 ```text
-app/                                 Go API and Dockerfile
-infrastructure/terraform/foundation/ Persistent account controls
-infrastructure/terraform/app/        Disposable application stack
+app/
+├── cmd/api/                         API entry point
+├── internal/api/                    HTTP routes and tests
+├── internal/delivery/               Domain model and in-memory store
+└── Dockerfile
+
+infrastructure/terraform/
+├── foundation/                      Account-level controls
+├── platform/                        Persistent application artifacts
+└── app/                             Runtime application infrastructure
+
 temp/                                Local planning notes
 ```
 
-## Prerequisites
+## API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Service health check |
+| `POST` | `/deliveries` | Create a delivery |
+| `GET` | `/deliveries` | List deliveries in creation order |
+| `GET` | `/deliveries/{id}` | Retrieve a delivery |
+| `PATCH` | `/deliveries/{id}` | Update pickup, destination, or status |
+
+Create a delivery:
+
+```http
+POST /deliveries
+Content-Type: application/json
+
+{
+  "pickup": "Wellington",
+  "destination": "Napier"
+}
+```
+
+Example response:
+
+```json
+{
+  "id": "delivery-fea93fe751cbb580",
+  "pickup": "Wellington",
+  "destination": "Napier",
+  "status": "created"
+}
+```
+
+Update a delivery:
+
+```http
+PATCH /deliveries/delivery-fea93fe751cbb580
+Content-Type: application/json
+
+{
+  "status": "scheduled"
+}
+```
+
+Valid statuses are:
+
+```text
+created
+scheduled
+picked_up
+in_transit
+delivered
+cancelled
+```
+
+The API rejects unknown JSON fields, malformed bodies, empty locations, and
+invalid statuses with `400 Bad Request`. Missing delivery IDs return
+`404 Not Found`.
+
+## Local development
+
+### Prerequisites
 
 - Go 1.26 or later
 - Docker Desktop
-- Terraform 1.10 or later
-- AWS CLI v2 authenticated to the target AWS account
 
-The examples use the Sydney region:
-
-```bash
-export AWS_REGION=ap-southeast-2
-aws sts get-caller-identity
-```
-
-## Run the API locally
+Run the API:
 
 ```bash
 cd app
 go run ./cmd/api
 ```
 
-The API listens on port `8080` by default. Set `PORT` to use a different port.
+The server listens on port `8080` by default. Override it with the `PORT`
+environment variable.
 
 ```bash
 curl http://localhost:8080/health
-curl http://localhost:8080/hello
+
+curl http://localhost:8080/deliveries \
+  -H 'Content-Type: application/json' \
+  -d '{"pickup":"Wellington","destination":"Napier"}'
+
+curl http://localhost:8080/deliveries
 ```
 
-## Run with Docker
-
-Build from the `app` directory, which contains the Dockerfile and its build
-context:
-
-```bash
-cd app
-docker build -t delivery-api:local .
-docker run --rm -p 8080:8080 delivery-api:local
-```
-
-From another terminal:
-
-```bash
-curl http://localhost:8080/health
-```
-
-The health response is:
-
-```json
-{"status":"ok"}
-```
-
-## Test
+Run the test suite:
 
 ```bash
 cd app
 go test ./...
+go test -race ./...
 ```
 
-## Terraform state backend
+### Docker
 
-The two Terraform roots store independent state objects in the same private S3
-bucket:
-
-```text
-Foundation: delivery-platform/foundation/terraform.tfstate
-App:        delivery-platform/dev/terraform.tfstate
-```
-
-The backend uses S3-native locking. The state bucket must exist before running
-`terraform init`, and should have versioning, encryption, and all public access
-blocked.
-
-Set the bucket name for your AWS account and initialize the backend:
+Build and run the container locally:
 
 ```bash
-export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export TF_STATE_BUCKET="delivery-platform-tfstate-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+docker build -t delivery-api:local app
+docker run --rm -p 8080:8080 delivery-api:local
+```
 
+Verify it from another terminal:
+
+```bash
+curl http://localhost:8080/health
+```
+
+## Deploy to AWS
+
+### Prerequisites
+
+- Terraform 1.10 or later
+- AWS CLI v2
+- Docker Desktop
+- AWS credentials with permission to create the configured resources
+- An S3 bucket for remote Terraform state
+
+Authenticate and set the deployment region:
+
+```bash
+export AWS_REGION=ap-southeast-2
+aws sts get-caller-identity
+```
+
+### 1. Create the state bucket
+
+The state bucket is a bootstrap dependency and is deliberately not managed by
+these Terraform roots. If it already exists, skip its creation and set
+`TF_STATE_BUCKET` to its name.
+
+Bucket names are globally unique, so choose a name available to your account:
+
+```bash
+export AWS_ACCOUNT_ID="$(
+  aws sts get-caller-identity --query Account --output text
+)"
+export TF_STATE_BUCKET="delivery-platform-tfstate-${AWS_ACCOUNT_ID}"
+
+aws s3api create-bucket \
+  --bucket "${TF_STATE_BUCKET}" \
+  --region "${AWS_REGION}" \
+  --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
+
+aws s3api put-bucket-versioning \
+  --bucket "${TF_STATE_BUCKET}" \
+  --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+  --bucket "${TF_STATE_BUCKET}" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+aws s3api put-public-access-block \
+  --bucket "${TF_STATE_BUCKET}" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+This repository currently uses `delivery-platform-tfstate`. Use that existing
+name when working with the current AWS account:
+
+```bash
+export TF_STATE_BUCKET=delivery-platform-tfstate
+```
+
+### 2. Initialize Terraform
+
+Each root uses the same bucket with a different state key:
+
+| Root | State key |
+| --- | --- |
+| Foundation | `delivery-platform/foundation/terraform.tfstate` |
+| Platform | `delivery-platform/platform/terraform.tfstate` |
+| App | `delivery-platform/dev/terraform.tfstate` |
+
+```bash
 terraform -chdir=infrastructure/terraform/foundation init \
+  -backend-config="bucket=${TF_STATE_BUCKET}"
+
+terraform -chdir=infrastructure/terraform/platform init \
   -backend-config="bucket=${TF_STATE_BUCKET}"
 
 terraform -chdir=infrastructure/terraform/app init \
   -backend-config="bucket=${TF_STATE_BUCKET}"
 ```
 
-Terraform caches the backend configuration under `.terraform`, so the bucket
-argument is only needed again when reinitializing the backend or using a fresh
-checkout.
+The S3 backend uses native state locking. Commit each root's
+`.terraform.lock.hcl`; do not commit `.terraform/`, state files, plans, or real
+variable files.
 
-## Configure Terraform inputs
+### 3. Configure variables
 
-Create the local variable file once:
+Create local variable files from the tracked examples:
 
 ```bash
 cp infrastructure/terraform/foundation/terraform.tfvars.example \
   infrastructure/terraform/foundation/terraform.tfvars
 
+cp infrastructure/terraform/platform/terraform.tfvars.example \
+  infrastructure/terraform/platform/terraform.tfvars
+
 cp infrastructure/terraform/app/terraform.tfvars.example \
   infrastructure/terraform/app/terraform.tfvars
 ```
 
-In the foundation variables, set `billing_alert_email` to the address that
-should receive account-wide cost alerts. The monthly budget defaults to USD 10.
+Update:
 
-In the app variables, set `allowed_cidr` to your current public IP with a `/32`
-suffix:
+- `foundation/terraform.tfvars`: set `billing_alert_email`; the budget defaults
+  to USD 10 per month.
+- `app/terraform.tfvars`: set `allowed_cidr` to your public IP with `/32` and,
+  after pushing an image, set `image_uri` to its complete ECR URI and tag.
+- `platform/terraform.tfvars`: defaults are suitable for the development
+  environment unless the region or naming changes.
+
+Find your current public IP with:
 
 ```bash
 curl https://checkip.amazonaws.com
 ```
 
-Also set `image_uri` to the complete immutable ECR image URI, including its tag.
-The disposable app runs one task by default.
+Real `terraform.tfvars` files are ignored by Git.
 
-The real `terraform.tfvars` is ignored by Git; keep `terraform.tfvars.example`
-updated with safe example values.
+### 4. Create foundation and platform resources
 
-## Deploy the persistent foundation
-
-Create the account-wide budget once and leave it running between development
-sessions:
+Apply the budget first:
 
 ```bash
-terraform -chdir=infrastructure/terraform/foundation fmt -check
-terraform -chdir=infrastructure/terraform/foundation validate
-terraform -chdir=infrastructure/terraform/foundation plan -out=foundation.tfplan
-terraform -chdir=infrastructure/terraform/foundation apply foundation.tfplan
+terraform -chdir=infrastructure/terraform/foundation plan \
+  -out=foundation.tfplan
+terraform -chdir=infrastructure/terraform/foundation apply \
+  foundation.tfplan
 ```
 
-The foundation budget sends actual-spend alerts at 30%, 50%, 80%, and 100%,
-plus a forecast alert at 80%. It excludes credits and refunds so they do not
-hide underlying usage. AWS Budgets receives delayed billing data, so this is an
-alerting guardrail rather than a guaranteed spending cap. Terraform deletion
-protection prevents accidental removal of the budget.
+The budget sends actual-spend alerts at 30%, 50%, 80%, and 100%, plus a
+forecast alert at 80%. AWS Budgets is an alerting mechanism, not a hard spending
+limit.
 
-## Deploy the disposable app
-
-After every complete teardown, ECR must be recreated before an image can be
-pushed, and the image must exist before the ECS service can start successfully.
-
-Create only the ECR repository the first time:
+Create the persistent ECR repository:
 
 ```bash
-terraform -chdir=infrastructure/terraform/app apply \
-  -target=aws_ecr_repository.api
+terraform -chdir=infrastructure/terraform/platform plan \
+  -out=platform.tfplan
+terraform -chdir=infrastructure/terraform/platform apply \
+  platform.tfplan
 ```
 
-Targeted applies are only used for this initial bootstrap. Normal deployments
-should use a complete plan.
+### 5. Build and push the image
 
-Get the repository URL and authenticate Docker:
+Get the ECR URL and authenticate Docker:
 
 ```bash
 export ECR_REPOSITORY_URL="$(
-  terraform -chdir=infrastructure/terraform/app output -raw ecr_repository_url
+  terraform -chdir=infrastructure/terraform/platform output \
+    -raw ecr_repository_url
 )"
 export ECR_REGISTRY="${ECR_REPOSITORY_URL%%/*}"
 
@@ -195,10 +333,10 @@ aws ecr get-login-password --region "${AWS_REGION}" |
   docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 ```
 
-Build and push a uniquely tagged x86 image from the repository root:
+Tags are immutable, so use a unique tag for every image:
 
 ```bash
-export IMAGE_TAG="$(git rev-parse --short HEAD)"
+export IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
 export IMAGE_URI="${ECR_REPOSITORY_URL}:${IMAGE_TAG}"
 
 docker build \
@@ -207,81 +345,38 @@ docker build \
   app
 
 docker push "${IMAGE_URI}"
+echo "${IMAGE_URI}"
 ```
 
-ECR tags are immutable in this project. Do not reuse a tag for a different
-image. Copy the value printed by `echo "${IMAGE_URI}"` into the `image_uri`
-entry in `terraform.tfvars`.
+Copy the printed URI into `image_uri` in
+`infrastructure/terraform/app/terraform.tfvars`.
 
-Create or update all infrastructure:
+### 6. Deploy the application stack
 
 ```bash
-terraform -chdir=infrastructure/terraform/app fmt -check
-terraform -chdir=infrastructure/terraform/app validate
-terraform -chdir=infrastructure/terraform/app plan -out=deployment.tfplan
-terraform -chdir=infrastructure/terraform/app apply deployment.tfplan
+terraform -chdir=infrastructure/terraform/app plan \
+  -out=deployment.tfplan
+terraform -chdir=infrastructure/terraform/app apply \
+  deployment.tfplan
 ```
 
-The configuration creates:
-
-- An encrypted ECR repository with immutable tags and scan-on-push
-- An ECS cluster, task definition, and one-task Fargate service
-- An ECS task execution role for ECR pulls and CloudWatch logging
-- A CloudWatch log group with seven-day retention
-- A security group allowing port `8080` only from `allowed_cidr`
-
-## Tear down the disposable app
-
-When the testing session is finished, destroy only the app root:
+Retrieve the ALB endpoint and verify the service:
 
 ```bash
-terraform -chdir=infrastructure/terraform/app destroy
+export API_URL="$(
+  terraform -chdir=infrastructure/terraform/app output -raw api_url
+)"
+
+curl "${API_URL}/health"
+
+curl "${API_URL}/deliveries" \
+  -H 'Content-Type: application/json' \
+  -d '{"pickup":"Wellington","destination":"Napier"}'
+
+curl "${API_URL}/deliveries"
 ```
 
-This removes ECS, ECR and its images, application IAM resources, the log group,
-and the application security group. ECR uses `force_delete`, so stored images do
-not block teardown. The S3 state bucket and persistent foundation budget remain.
-
-The next session starts again with the ECR-targeted apply and image upload
-steps above. Do not run `terraform destroy` in the `foundation` directory; its
-budget is intentionally protected from deletion.
-
-## Reach the deployed API
-
-The task's public IP can change whenever ECS replaces it. Retrieve the current
-address with the AWS CLI:
-
-```bash
-export ECS_CLUSTER=delivery-platform-dev
-export ECS_SERVICE=delivery-platform-dev-api
-
-export ECS_TASK_ARN="$(
-  aws ecs list-tasks \
-    --cluster "${ECS_CLUSTER}" \
-    --service-name "${ECS_SERVICE}" \
-    --query 'taskArns[0]' \
-    --output text
-)"
-
-export ECS_ENI_ID="$(
-  aws ecs describe-tasks \
-    --cluster "${ECS_CLUSTER}" \
-    --tasks "${ECS_TASK_ARN}" \
-    --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value | [0]' \
-    --output text
-)"
-
-export ECS_PUBLIC_IP="$(
-  aws ec2 describe-network-interfaces \
-    --network-interface-ids "${ECS_ENI_ID}" \
-    --query 'NetworkInterfaces[0].Association.PublicIp' \
-    --output text
-)"
-
-curl "http://${ECS_PUBLIC_IP}:8080/health"
-```
-
-Tail the application logs with:
+Tail application logs:
 
 ```bash
 aws logs tail /ecs/delivery-platform-dev-api \
@@ -289,5 +384,52 @@ aws logs tail /ecs/delivery-platform-dev-api \
   --follow
 ```
 
-If your public IP changes, update `allowed_cidr` in `terraform.tfvars`, then
-run another complete plan and apply from `infrastructure/terraform/app`.
+## Updating the service
+
+For an application change:
+
+1. Run the Go tests.
+2. Build and push a new immutable image tag.
+3. Update `image_uri` in the app variable file.
+4. Plan and apply the app root.
+
+ECS registers a new task-definition revision and performs a rolling deployment
+behind the existing target group.
+
+## Teardown
+
+The ALB, NAT Gateway, and Fargate task incur charges while provisioned. For a
+normal end-of-session teardown, destroy only the disposable app root:
+
+```bash
+terraform -chdir=infrastructure/terraform/app destroy
+```
+
+This preserves the budget, ECR repository, and images, making the next session
+faster. Recreate the app with another plan and apply.
+
+The foundation budget and platform repository have Terraform
+`prevent_destroy` guards. A full teardown requires intentionally removing those
+guards first. A non-empty ECR repository also requires `force_delete = true`.
+The S3 state bucket remains separate and must be deleted manually if it is ever
+no longer required.
+
+## Troubleshooting
+
+- `503 Service Unavailable`: wait for ECS to register a healthy target, then
+  inspect the target group health and CloudWatch logs.
+- Request timeout: confirm your current public IP matches `allowed_cidr` in the
+  app variable file and reapply if it changed.
+- ECR tag already exists: tags are immutable; build with a new tag.
+- ECS cannot pull the image: confirm `image_uri` exists in ECR and includes the
+  tag, and verify that the private subnet has NAT connectivity.
+
+## Roadmap
+
+- Aurora PostgreSQL persistence and migrations
+- Delivery status history
+- SQS-backed delivery processing worker
+- EventBridge lifecycle events
+- API Gateway with VPC Link
+- Auth0 authentication and user-scoped deliveries
+- Frontend and custom domain

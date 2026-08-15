@@ -16,6 +16,17 @@ variable "environment" {
   default     = "dev"
 }
 
+variable "vpc_cidr" {
+  description = "IPv4 CIDR block for the application VPC."
+  type        = string
+  default     = "10.0.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.vpc_cidr))
+    error_message = "vpc_cidr must be a valid IPv4 CIDR block."
+  }
+}
+
 variable "allowed_cidr" {
   description = "Public IP allowed to access the API, expressed as a /32 CIDR"
   type        = string

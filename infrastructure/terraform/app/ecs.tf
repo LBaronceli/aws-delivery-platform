@@ -70,9 +70,9 @@ resource "aws_ecs_service" "api" {
   }
 
   network_configuration {
-    subnets          = data.aws_subnets.default.ids
+    subnets          = [for subnet in aws_subnet.private : subnet.id]
     security_groups  = [aws_security_group.api.id]
-    assign_public_ip = true
+    assign_public_ip = false
   }
 
   deployment_circuit_breaker {

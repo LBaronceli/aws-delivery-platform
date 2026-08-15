@@ -1,7 +1,7 @@
 resource "aws_ecr_repository" "api" {
   name                 = "${local.name_prefix}-api"
   image_tag_mutability = "IMMUTABLE"
-  force_delete         = true
+  force_delete         = false
 
   image_scanning_configuration {
     scan_on_push = true
@@ -9,5 +9,9 @@ resource "aws_ecr_repository" "api" {
 
   encryption_configuration {
     encryption_type = "AES256"
+  }
+
+  lifecycle {
+    prevent_destroy = true
   }
 }

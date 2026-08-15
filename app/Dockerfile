@@ -1,6 +1,6 @@
 FROM golang:1.26-alpine AS build
 
-WORKDIR .
+WORKDIR /src
 
 COPY go.mod ./
 RUN go mod download
