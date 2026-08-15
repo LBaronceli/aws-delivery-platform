@@ -1,5 +1,5 @@
 resource "aws_budgets_budget" "monthly_account_cost" {
-  name         = "${local.name_prefix}-account-monthly-cost"
+  name         = "${var.project_name}-account-monthly-cost"
   budget_type  = "COST"
   limit_amount = tostring(var.monthly_budget_amount)
   limit_unit   = "USD"

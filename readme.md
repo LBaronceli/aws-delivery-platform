@@ -27,9 +27,10 @@ Balancer and API Gateway later.
 ## Repository layout
 
 ```text
-app/                        Go API and Dockerfile
-infrastructure/terraform/   AWS infrastructure
-temp/                       Local planning notes
+app/                                 Go API and Dockerfile
+infrastructure/terraform/foundation/ Persistent account controls
+infrastructure/terraform/app/        Disposable application stack
+temp/                                Local planning notes
 ```
 
 ## Prerequisites
@@ -92,10 +93,12 @@ go test ./...
 
 ## Terraform state backend
 
-Terraform stores development state at this key in a private S3 bucket:
+The two Terraform roots store independent state objects in the same private S3
+bucket:
 
 ```text
-delivery-platform/dev/terraform.tfstate
+Foundation: delivery-platform/foundation/terraform.tfstate
+App:        delivery-platform/dev/terraform.tfstate
 ```
 
 The backend uses S3-native locking. The state bucket must exist before running
@@ -108,7 +111,10 @@ Set the bucket name for your AWS account and initialize the backend:
 export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 export TF_STATE_BUCKET="delivery-platform-tfstate-${AWS_ACCOUNT_ID}-${AWS_REGION}"
 
-terraform -chdir=infrastructure/terraform init \
+terraform -chdir=infrastructure/terraform/foundation init \
+  -backend-config="bucket=${TF_STATE_BUCKET}"
+
+terraform -chdir=infrastructure/terraform/app init \
   -backend-config="bucket=${TF_STATE_BUCKET}"
 ```
 
@@ -121,37 +127,56 @@ checkout.
 Create the local variable file once:
 
 ```bash
-cp infrastructure/terraform/terraform.tfvars.example \
-  infrastructure/terraform/terraform.tfvars
+cp infrastructure/terraform/foundation/terraform.tfvars.example \
+  infrastructure/terraform/foundation/terraform.tfvars
+
+cp infrastructure/terraform/app/terraform.tfvars.example \
+  infrastructure/terraform/app/terraform.tfvars
 ```
 
-Set `allowed_cidr` to your current public IP with a `/32` suffix:
+In the foundation variables, set `billing_alert_email` to the address that
+should receive account-wide cost alerts. The monthly budget defaults to USD 10.
+
+In the app variables, set `allowed_cidr` to your current public IP with a `/32`
+suffix:
 
 ```bash
 curl https://checkip.amazonaws.com
 ```
 
-Also set:
-
-- `image_uri` to the complete immutable ECR image URI, including its tag
-- `billing_alert_email` to the address that should receive cost alerts
-- `ecs_desired_count` to `1` while using the API, or `0` to stop its Fargate
-  compute charges
-- `monthly_budget_amount` to the account-wide monthly target, which defaults
-  to USD 10
+Also set `image_uri` to the complete immutable ECR image URI, including its tag.
+The disposable app runs one task by default.
 
 The real `terraform.tfvars` is ignored by Git; keep `terraform.tfvars.example`
 updated with safe example values.
 
-## First deployment
+## Deploy the persistent foundation
 
-There is a first-deployment dependency: ECR must exist before an image can be
+Create the account-wide budget once and leave it running between development
+sessions:
+
+```bash
+terraform -chdir=infrastructure/terraform/foundation fmt -check
+terraform -chdir=infrastructure/terraform/foundation validate
+terraform -chdir=infrastructure/terraform/foundation plan -out=foundation.tfplan
+terraform -chdir=infrastructure/terraform/foundation apply foundation.tfplan
+```
+
+The foundation budget sends actual-spend alerts at 30%, 50%, 80%, and 100%,
+plus a forecast alert at 80%. It excludes credits and refunds so they do not
+hide underlying usage. AWS Budgets receives delayed billing data, so this is an
+alerting guardrail rather than a guaranteed spending cap. Terraform deletion
+protection prevents accidental removal of the budget.
+
+## Deploy the disposable app
+
+After every complete teardown, ECR must be recreated before an image can be
 pushed, and the image must exist before the ECS service can start successfully.
 
 Create only the ECR repository the first time:
 
 ```bash
-terraform -chdir=infrastructure/terraform apply \
+terraform -chdir=infrastructure/terraform/app apply \
   -target=aws_ecr_repository.api
 ```
 
@@ -162,7 +187,7 @@ Get the repository URL and authenticate Docker:
 
 ```bash
 export ECR_REPOSITORY_URL="$(
-  terraform -chdir=infrastructure/terraform output -raw ecr_repository_url
+  terraform -chdir=infrastructure/terraform/app output -raw ecr_repository_url
 )"
 export ECR_REGISTRY="${ECR_REPOSITORY_URL%%/*}"
 
@@ -191,46 +216,35 @@ entry in `terraform.tfvars`.
 Create or update all infrastructure:
 
 ```bash
-terraform -chdir=infrastructure/terraform fmt -check
-terraform -chdir=infrastructure/terraform validate
-terraform -chdir=infrastructure/terraform plan -out=deployment.tfplan
-terraform -chdir=infrastructure/terraform apply deployment.tfplan
+terraform -chdir=infrastructure/terraform/app fmt -check
+terraform -chdir=infrastructure/terraform/app validate
+terraform -chdir=infrastructure/terraform/app plan -out=deployment.tfplan
+terraform -chdir=infrastructure/terraform/app apply deployment.tfplan
 ```
 
 The configuration creates:
 
 - An encrypted ECR repository with immutable tags and scan-on-push
-- An ECS cluster, task definition, and configurable Fargate service
+- An ECS cluster, task definition, and one-task Fargate service
 - An ECS task execution role for ECR pulls and CloudWatch logging
 - A CloudWatch log group with seven-day retention
 - A security group allowing port `8080` only from `allowed_cidr`
-- An account-wide USD 10 monthly budget with actual-spend alerts at 30%, 50%,
-  80%, and 100%, plus a forecast alert at 80%
 
-The budget deliberately excludes credits and refunds from its calculation so
-they do not hide underlying usage. AWS Budgets receives delayed billing data,
-so it is an alerting guardrail rather than a guaranteed spending cap. The
-budget resource has Terraform deletion protection to prevent it from being
-removed accidentally.
+## Tear down the disposable app
 
-## Start and stop the development service
+When the testing session is finished, destroy only the app root:
 
-The local configuration defaults to zero running ECS tasks. To start the API,
-set this in `terraform.tfvars` and apply a complete plan:
-
-```hcl
-ecs_desired_count = 1
+```bash
+terraform -chdir=infrastructure/terraform/app destroy
 ```
 
-When finished testing, change it back and apply again:
+This removes ECS, ECR and its images, application IAM resources, the log group,
+and the application security group. ECR uses `force_delete`, so stored images do
+not block teardown. The S3 state bucket and persistent foundation budget remain.
 
-```hcl
-ecs_desired_count = 0
-```
-
-Setting the count to zero stops Fargate compute charges without deleting the
-ECS service or its surrounding infrastructure. ECR image storage, S3 state,
-and CloudWatch log storage may still incur small charges.
+The next session starts again with the ECR-targeted apply and image upload
+steps above. Do not run `terraform destroy` in the `foundation` directory; its
+budget is intentionally protected from deletion.
 
 ## Reach the deployed API
 
@@ -276,4 +290,4 @@ aws logs tail /ecs/delivery-platform-dev-api \
 ```
 
 If your public IP changes, update `allowed_cidr` in `terraform.tfvars`, then
-run another complete Terraform plan and apply.
+run another complete plan and apply from `infrastructure/terraform/app`.
